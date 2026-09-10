@@ -25,7 +25,7 @@ set -euo pipefail
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 workspace=$(cd "$script_dir/.." && pwd)
 
-llvm_version=22.1.8
+llvm_version=23.1.2
 cmake_version=4.3.3
 ninja_version=1.13.2
 destination="$script_dir/artifacts/portable-tools"
@@ -52,13 +52,13 @@ done
 
 case "$arch" in
     x86_64) llvm_release_arch=X64; target_triple=x86_64-unknown-linux-gnu
-            llvm_release_sha256=df0e1ecf16caf3489a272a5eea4eec9b0d82878f6477fa309504f918a0006384
+            llvm_release_sha256=910888b74966149729966ba26f0bed8a1f6fee01ebfc55596101dd71fc24be48
             cmake_release_arch=x86_64
             cmake_sha256=927b2368a946c37269c3a66225ab00544e756459cdd0b5d0da438694fb9ff802
             ninja_asset=ninja-linux.zip
             ninja_sha256=5749cbc4e668273514150a80e387a957f933c6ed3f5f11e03fb30955e2bbead6 ;;
     aarch64) llvm_release_arch=ARM64; target_triple=aarch64-unknown-linux-gnu
-            llvm_release_sha256=805efad2bb91cb4967fa569e0881d10c0f69c04461cf671cccbae19f547acc34
+            llvm_release_sha256=db3f779e38af09131667172cd3da33d92be053215cff4ec7e1eea06a28b566a5
             cmake_release_arch=aarch64
             cmake_sha256=9ea38356dbd3e32e51029a3e09a0f2f8e117ef4fbcaad7a21ffb36409bbd5cb4
             ninja_asset=ninja-linux-aarch64.zip
@@ -102,10 +102,10 @@ mkdir -p "$work/bin" "$work/lib/$target_triple" "$work/include/$target_triple/c+
 
 # --- clang/lld/llvm-ar, pruned from the official LLVM release ---
 
-llvm_archive_name="LLVM-$llvm_version-Linux-$llvm_release_arch.tar.xz"
+llvm_archive_name="LLVM-PR222203-82a40a64e737599d6cf1d95dbf27ec1759b5102a-Linux-$llvm_release_arch.tar.xz"
 llvm_archive="$downloads/$llvm_archive_name"
 download_verified "$llvm_archive" \
-    "https://github.com/llvm/llvm-project/releases/download/llvmorg-$llvm_version/$llvm_archive_name" \
+    "https://github.com/theofficialgman/testing/releases/download/gmans-releases/$llvm_archive_name" \
     "$llvm_release_sha256"
 
 extract_root="$script_dir/artifacts/.extract-clang-$arch"
@@ -120,9 +120,9 @@ echo "prepare-portable-tools.sh: pruning to the minimal compile+link toolchain..
 
 # clang: the real driver executable plus the clang/clang++ symlinks CMake/local-build.sh invoke.
 # Stripped: debug symbols are dead weight for a bundled compiler nobody will debug.
-cp -a "$src/bin/clang-22" "$work/bin/"
-strip "$work/bin/clang-22"
-ln -s clang-22 "$work/bin/clang"
+cp -a "$src/bin/clang-23" "$work/bin/"
+strip "$work/bin/clang-23"
+ln -s clang-23 "$work/bin/clang"
 ln -s clang "$work/bin/clang++"
 
 # lld: linked via -fuse-ld=lld, which clang resolves by looking for ld.lld next to itself first -
