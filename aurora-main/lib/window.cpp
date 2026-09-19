@@ -705,6 +705,19 @@ void set_display_mode(AuroraDisplayMode mode) {
 
 AuroraDisplayMode get_display_mode() { return g_displayMode.load(std::memory_order_acquire); }
 
+float display_refresh_rate() noexcept {
+  if (g_window == nullptr) {
+    return 0.f;
+  }
+  // Exclusive fullscreen carries its own mode; every other case scans out at the display's current one.
+  if (const SDL_DisplayMode* fullscreen = SDL_GetWindowFullscreenMode(g_window); fullscreen != nullptr) {
+    return fullscreen->refresh_rate;
+  }
+  const SDL_DisplayID display = SDL_GetDisplayForWindow(g_window);
+  const SDL_DisplayMode* current = display != 0 ? SDL_GetCurrentDisplayMode(display) : nullptr;
+  return current != nullptr ? current->refresh_rate : 0.f;
+}
+
 void set_window_size(uint32_t width, uint32_t height) {
   TRY_WARN(SDL_RestoreWindow(g_window), "Failed to un-maximize window: {}", SDL_GetError());
   TRY_WARN(SDL_SetWindowSize(g_window, width, height), "Failed to set window size: {}", SDL_GetError());

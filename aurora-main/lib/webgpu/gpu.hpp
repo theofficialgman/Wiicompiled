@@ -65,6 +65,12 @@ void shutdown();
 // threads call this at ordered boundaries to turn it into the one user-visible fatal error.
 void fail_if_device_lost() noexcept;
 void release_surface() noexcept;
+// True while the surface is configured FifoRelaxed (or Fifo where that is not offered) so the
+// display, not a software timer, bounds how fast frames leave the presenter.
+bool display_locked_present_active() noexcept;
+// True when the present-mode policy now disagrees with the configured mode and the surface should
+// be reconfigured. Safe from any thread; never touches surface capabilities.
+bool present_mode_policy_changed() noexcept;
 bool refresh_surface(bool recreate = true);
 void resize_swapchain(uint32_t width, uint32_t height, uint32_t native_width, uint32_t native_height,
                       bool force = false);

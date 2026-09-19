@@ -49,6 +49,8 @@ void set_fullscreen(bool fullscreen);
 bool get_fullscreen();
 void set_display_mode(AuroraDisplayMode mode);
 AuroraDisplayMode get_display_mode();
+/// Refresh rate in Hz the window is currently scanned out at, or 0 when it cannot be determined.
+float display_refresh_rate() noexcept;
 void set_window_size(uint32_t width, uint32_t height);
 void set_window_position(uint32_t x, uint32_t y);
 void center_window();

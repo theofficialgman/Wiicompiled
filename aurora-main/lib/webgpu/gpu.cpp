@@ -18,6 +18,7 @@
 #include <webgpu/webgpu_cpp.h>
 
 #include "../gfx/common.hpp"
+#include "../gx/frame_interpolation.hpp"
 #include "../internal.hpp"
 #include "../window.hpp"
 #include "../dolphin/vi/vi_internal.hpp"
@@ -66,6 +67,10 @@ static wgpu::Adapter g_adapter;
 wgpu::Instance g_instance;
 static wgpu::AdapterInfo g_adapterInfo;
 static wgpu::SurfaceCapabilities g_surfaceCapabilities;
+// Published by the render thread when it configures the surface, read by the SDL thread's policy
+// poll, so neither ever touches g_surfaceCapabilities across threads.
+static std::atomic_bool g_fifoRelaxedSupported{false};
+static std::atomic_bool g_displayLockedPresent{false};
 bool g_bcTexturesSupported;
 // Written by Dawn's device-loss callback and consumed at ordered frame boundaries. Keep the
 // callback free of logging, allocation, teardown and renderer state mutation.
@@ -113,8 +118,65 @@ RenderTargetSize clamp_frame_buffer_size(uint32_t width, uint32_t height) noexce
   return {budgeted.width, budgeted.height};
 }
 
-// V-Sync is never enabled: the guest drives its own pacing, and blocking in Present() couples the
-// whole machine to the monitor (a 120 FPS target on a 75 Hz display runs in slow motion).
+// MKW_FIFO_RELAXED: unset = automatic, 0 = never, 1 = whenever interpolation is off regardless of
+// the display's refresh rate. Some compositors (Xwayland/KDE) stop scanning out a FifoRelaxed
+// surface, so there has to be a way back to Mailbox/Immediate.
+int fifo_relaxed_override() noexcept {
+  static const int value = [] {
+    const char* env = std::getenv("MKW_FIFO_RELAXED");
+    if (env == nullptr || env[0] == '\0') {
+      return -1;
+    }
+    return env[0] == '0' ? 0 : 1;
+  }();
+  return value;
+}
+
+// Native 60 fps on a ~60 Hz display is the one case where letting the display pace presentation
+// costs nothing: there is a single presentation slot per guest frame and no interpolated slot
+// deadlines for a vblank to miss. Anything else (interpolation on, or a display that is not ~60 Hz)
+// would run in slow motion or cap the interpolated rate, so it stays on Mailbox/Immediate.
+bool display_locked_present_wanted() noexcept {
+  const int override = fifo_relaxed_override();
+  if (override == 0 || gx::frame_interpolation_active()) {
+    return false;
+  }
+  if (override == 1) {
+    return true;
+  }
+  const float refreshHz = window::display_refresh_rate();
+  return refreshHz >= 59.f && refreshHz <= 61.f;
+}
+
+// Says why the display does or does not pace presentation, once per change, so a surface stuck on
+// Mailbox is explainable from the log alone.
+void log_present_mode_policy(bool displayLocked, bool fifoRelaxedSupported) {
+  struct State {
+    bool displayLocked;
+    bool fifoRelaxedSupported;
+    uint32_t interpolationFps;
+    int refreshCentiHz;
+    int override;
+  };
+  static bool haveLast = false;
+  static State last{};
+  const State state{displayLocked, fifoRelaxedSupported, gx::frame_interpolation_fps(),
+                    static_cast<int>(window::display_refresh_rate() * 100.f), fifo_relaxed_override()};
+  if (haveLast && state.displayLocked == last.displayLocked &&
+      state.fifoRelaxedSupported == last.fifoRelaxedSupported &&
+      state.interpolationFps == last.interpolationFps && state.refreshCentiHz == last.refreshCentiHz &&
+      state.override == last.override) {
+    return;
+  }
+  haveLast = true;
+  last = state;
+  Log.info("Present mode policy: display-paced={} (interpolation {} fps, display {:.2f} Hz, "
+           "FifoRelaxed {}, MKW_FIFO_RELAXED {})",
+           displayLocked, state.interpolationFps, static_cast<double>(state.refreshCentiHz) / 100.0,
+           fifoRelaxedSupported ? "offered" : "not offered",
+           state.override < 0 ? "unset" : (state.override == 0 ? "0" : "1"));
+}
+
 wgpu::PresentMode best_present_mode() {
   const auto supports = [](const wgpu::PresentMode candidate) {
     for (size_t i = 0; i < g_surfaceCapabilities.presentModeCount; ++i) {
@@ -124,23 +186,38 @@ wgpu::PresentMode best_present_mode() {
     }
     return false;
   };
-  // Vulkan prefers Mailbox, every other backend Immediate. Under window capture the Vulkan driver
-  // cannot flip and Immediate leaks about a megabyte per present until the device is lost.
-  const bool preferMailbox = g_backendType == wgpu::BackendType::Vulkan;
-  if (preferMailbox && supports(wgpu::PresentMode::Mailbox)) {
+  // Otherwise V-Sync stays off: the guest drives its own pacing, and blocking in Present() couples
+  // the whole machine to the monitor (a 120 FPS target on a 75 Hz display runs in slow motion).
+  // The display paces presentation only for native 60 fps on a ~60 Hz display (see
+  // display_locked_present_wanted). FifoRelaxed presents a late frame immediately instead of waiting
+  // a whole extra vblank; a surface that does not offer it (compositors differ) gets plain Fifo.
+  const bool fifoRelaxedSupported = supports(wgpu::PresentMode::FifoRelaxed);
+  const bool displayLocked = display_locked_present_wanted();
+  g_fifoRelaxedSupported.store(fifoRelaxedSupported, std::memory_order_release);
+  g_displayLockedPresent.store(displayLocked, std::memory_order_release);
+  log_present_mode_policy(displayLocked, fifoRelaxedSupported);
+  if (displayLocked) {
+    return fifoRelaxedSupported ? wgpu::PresentMode::FifoRelaxed : wgpu::PresentMode::Fifo;
+  }
+  // Preference order: FifoRelaxed, Fifo (display-paced, above), then Mailbox, then Immediate, both
+  // paced by the presenter's own slot deadlines. Mailbox comes first everywhere it works: it never
+  // tears, and under window capture the Vulkan driver cannot flip so Immediate leaks about a
+  // megabyte per present until the device is lost. Dawn's Metal backend only implements Immediate
+  // properly.
+  if (g_backendType != wgpu::BackendType::Metal && supports(wgpu::PresentMode::Mailbox)) {
     return wgpu::PresentMode::Mailbox;
   }
   if (supports(wgpu::PresentMode::Immediate)) {
     return wgpu::PresentMode::Immediate;
   }
-  if (g_backendType != wgpu::BackendType::Metal && supports(wgpu::PresentMode::Mailbox)) {
-    return wgpu::PresentMode::Mailbox;
-  }
   // Mailbox is preferred over Fifo because Fifo caps presentation at the refresh rate and every slot
   // deadline after the first is missed. Reaching this means neither is offered, so say so loudly.
-  Log.warn("Surface supports neither Immediate nor Mailbox; falling back to Fifo. Presentation "
-           "is capped at the display refresh rate, so the game may run slower than its own "
-           "pace and frame interpolation cannot exceed the refresh rate.");
+  static bool warnedFifoFallback = false;
+  if (!std::exchange(warnedFifoFallback, true)) {
+    Log.warn("Surface supports neither Immediate nor Mailbox; falling back to Fifo. Presentation "
+             "is capped at the display refresh rate, so the game may run slower than its own "
+             "pace and frame interpolation cannot exceed the refresh rate.");
+  }
   return wgpu::PresentMode::Fifo;
 }
 
@@ -883,6 +960,12 @@ void release_surface() noexcept {
   }
 }
 
+bool display_locked_present_active() noexcept { return g_displayLockedPresent.load(std::memory_order_acquire); }
+
+bool present_mode_policy_changed() noexcept {
+  return display_locked_present_wanted() != g_displayLockedPresent.load(std::memory_order_acquire);
+}
+
 bool refresh_surface(bool recreate) {
   if (!g_instance || !g_device) {
     return false;
@@ -950,6 +1033,14 @@ void resize_swapchain(uint32_t width, uint32_t height, uint32_t native_width, ui
   }
   g_graphicsConfig.surfaceConfiguration.width = native_width;
   g_graphicsConfig.surfaceConfiguration.height = native_height;
+  // Every configure re-derives the mode: interpolation, the display's refresh rate or the
+  // MKW_FIFO_RELAXED override may have changed since the surface was last configured.
+  if (const auto presentMode = best_present_mode();
+      presentMode != g_graphicsConfig.surfaceConfiguration.presentMode) {
+    Log.info("Present mode {} -> {}", magic_enum::enum_name(g_graphicsConfig.surfaceConfiguration.presentMode),
+             magic_enum::enum_name(presentMode));
+    g_graphicsConfig.surfaceConfiguration.presentMode = presentMode;
+  }
   auto surfaceConfiguration = g_graphicsConfig.surfaceConfiguration;
   surfaceConfiguration.device = g_device;
   g_surface.Configure(&surfaceConfiguration);

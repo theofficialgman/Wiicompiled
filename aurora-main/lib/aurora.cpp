@@ -492,6 +492,17 @@ void request_surface_recreate() noexcept {
   g_surfaceReconfigurePending.store(true, std::memory_order_release);
 }
 
+// Whether the surface should be FifoRelaxed depends on interpolation and on the display's refresh
+// rate, either of which can change at runtime. The mode itself is only ever applied by the render
+// thread while it reconfigures, so all this does is ask for that reconfigure when the policy moved.
+void poll_present_mode_policy() noexcept {
+#ifdef AURORA_ENABLE_GX
+  if (webgpu::present_mode_policy_changed()) {
+    request_surface_reconfigure();
+  }
+#endif
+}
+
 struct PendingFrameCapture {
   wgpu::Buffer buffer;
   uint32_t width = 0;
@@ -775,6 +786,8 @@ struct AcquiredSurfaceTexture {
   wgpu::TextureView view;
 };
 
+std::atomic<bool> s_surfaceWasSuboptimal{false};
+
 std::optional<AcquiredSurfaceTexture> acquire_surface_texture() noexcept {
   if (!window::is_presentable()) {
     request_surface_reconfigure();
@@ -789,13 +802,19 @@ std::optional<AcquiredSurfaceTexture> acquire_surface_texture() noexcept {
   g_surface.GetCurrentTexture(&surfaceTexture);
   switch (surfaceTexture.status) {
   case wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal:
+    s_surfaceWasSuboptimal.store(false, std::memory_order_relaxed);
     return AcquiredSurfaceTexture{
         .texture = surfaceTexture.texture,
         .view = surfaceTexture.texture.CreateView(),
     };
   case wgpu::SurfaceGetCurrentTextureStatus::SuccessSuboptimal:
-    Log.info("Surface texture is suboptimal, deferring swapchain reconfiguration");
-    request_surface_reconfigure();
+    // The texture is still usable. A compositor that reports suboptimal on every acquire (Xwayland/KDE
+    // does, notably under FifoRelaxed) would otherwise force a reconfigure each frame, so ask for one
+    // only on the transition into suboptimal.
+    if (!s_surfaceWasSuboptimal.exchange(true, std::memory_order_relaxed)) {
+      Log.info("Surface texture is suboptimal, deferring swapchain reconfiguration");
+      request_surface_reconfigure();
+    }
     return AcquiredSurfaceTexture{
         .texture = surfaceTexture.texture,
         .view = surfaceTexture.texture.CreateView(),
@@ -1116,8 +1135,13 @@ void enqueue_presentations(std::vector<PresentationJob>&& jobs) {
   ensure_presenter_started();
   // Scale the bound with the group being handed over: a 240 Hz frame enqueues four jobs at once,
   // and a bound sized for two groups blocked the frame worker on a draining one.
+  // With the surface FifoRelaxed the display bounds how fast the presenter drains (acquire waits for a
+  // free swapchain image), so a queue any deeper than the newest group only adds latency: replace
+  // whatever is still waiting instead of buffering behind vblank.
+  const bool displayLocked = webgpu::display_locked_present_active();
   const size_t maximumQueuedJobs =
-      (std::max)(static_cast<size_t>(2 * (gx::MaxInterpolatedFrames + 1)), 3 * jobs.size());
+      displayLocked ? jobs.size()
+                    : (std::max)(static_cast<size_t>(2 * (gx::MaxInterpolatedFrames + 1)), 3 * jobs.size());
   std::unique_lock lock(g_presenter.mutex);
   if (g_presenter.stop) {
     return;
@@ -1135,7 +1159,10 @@ void enqueue_presentations(std::vector<PresentationJob>&& jobs) {
       droppedSinceWarning += dropped;
       const auto now = PresentClock::now();
       if (lastWarning == PresentClock::time_point{} || now - lastWarning >= std::chrono::seconds(1)) {
-        Log.warn("Presenter fell behind; dropped {} stale presentation jobs", droppedSinceWarning);
+        // Display-locked, a lone drop is the guest clock and the display drifting apart, not a stall.
+        if (!displayLocked || droppedSinceWarning >= 4) {
+          Log.warn("Presenter fell behind; dropped {} stale presentation jobs", droppedSinceWarning);
+        }
         droppedSinceWarning = 0;
         lastWarning = now;
       }
@@ -1246,6 +1273,11 @@ const AuroraEvent* update() noexcept {
   if (g_initialFrame) {
     g_initialFrame = false;
     input::initialize();
+  }
+  static PresentClock::time_point lastPolicyPoll{};
+  if (const auto now = PresentClock::now(); now - lastPolicyPoll >= std::chrono::seconds(1)) {
+    lastPolicyPoll = now;
+    poll_present_mode_policy();
   }
   return window::poll_events();
 }
@@ -1839,6 +1871,7 @@ void aurora_get_present_timing(AuroraPresentTiming* timing) {
 void aurora_set_frame_interpolation_fps(uint32_t targetFps) {
 #ifdef AURORA_ENABLE_GX
   aurora::gx::set_frame_interpolation_fps(targetFps);
+  aurora::poll_present_mode_policy();
 #else
   (void)targetFps;
 #endif
