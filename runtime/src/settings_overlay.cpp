@@ -112,6 +112,7 @@ bool g_showFps = RuntimeConfigFile::ShowFps(true);
 #if defined(__APPLE__)
 bool g_metalFxSpatialUpscaling = RuntimeConfigFile::MetalFxSpatialUpscaling(false);
 #endif
+bool g_forceAspect169 = RuntimeConfigFile::ForceAspect169Enabled();
 uint32_t g_disabledPostProcessingPaths = RuntimeConfigFile::DisabledPostProcessingPaths(0);
 std::array<int32_t, PAD_MAX_CONTROLLERS> g_configuredControllerIndices = [] {
     std::array<int32_t, PAD_MAX_CONTROLLERS> indices{};
@@ -1020,6 +1021,12 @@ void DrawAudioSettings() {
 
 void DrawGraphicsSettings() {
     g_displayMode = static_cast<int>(aurora_get_display_mode());
+    if (ImGui::Checkbox("Force 16:9", &g_forceAspect169)) {
+        SetMkwForceAspect169(g_forceAspect169);
+        RuntimeConfigFile::SetForceAspect169(g_forceAspect169);
+    }
+    ImGui::TextDisabled("Keep a 16:9 image with black bars when the window has another shape.");
+    ImGui::Separator();
     struct EffectFlag {
         const char* label;
         uint32_t flag;
